@@ -54,75 +54,86 @@ impl fmt::Display for Face {
 }
 
 #[derive(Debug)]
-enum ErrorRepr {
-    ParseError(String),
-    ParseFloatError(num::ParseFloatError),
-    ParseIntError(num::ParseIntError),
+pub enum Error {
+    ParseError(ParseError),
     IoError(io::Error),
     ImagefmtError(imagefmt::Error),
 }
 
-#[derive(Debug)]
-pub struct ObjectError {
-    desc: &'static str,
-    cause: ErrorRepr,
-}
-
-impl From<io::Error> for ObjectError {
-    fn from(err: io::Error) -> ObjectError {
-        ObjectError {
-            desc: "IO error",
-            cause: ErrorRepr::IoError(err),
-        }
+impl From<ParseError> for Error {
+    fn from(err: ParseError) -> Error {
+        Error::ParseError(err)
     }
 }
 
-impl From<imagefmt::Error> for ObjectError {
-    fn from(err: imagefmt::Error) -> ObjectError {
-        ObjectError {
-            desc: "image decode error",
-            cause: ErrorRepr::ImagefmtError(err),
-        }
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Error {
+        Error::IoError(err)
     }
 }
 
-impl From<num::ParseFloatError> for ObjectError {
-    fn from(err: num::ParseFloatError) -> ObjectError {
-        ObjectError {
-            desc: "Format error",
-            cause: ErrorRepr::ParseFloatError(err),
-        }
+impl From<imagefmt::Error> for Error {
+    fn from(err: imagefmt::Error) -> Error {
+        Error::ImagefmtError(err)
     }
 }
 
-impl From<num::ParseIntError> for ObjectError {
-    fn from(err: num::ParseIntError) -> ObjectError {
-        ObjectError {
-            desc: "Format error",
-            cause: ErrorRepr::ParseIntError(err),
-        }
-    }
-}
-
-impl error::Error for ObjectError {
+impl error::Error for Error {
     fn description(&self) -> &str {
-        self.desc
+        match *self {
+            Error::ParseError(ref err) => err.description(),
+            Error::IoError(ref err) => err.description(),
+            Error::ImagefmtError(ref err) => err.description(),
+        }
     }
 
     fn cause(&self) -> Option<&error::Error> {
-        match self.cause {
-            ErrorRepr::ParseError(_) => None,
-            ErrorRepr::ParseFloatError(ref err) => Some(err as &error::Error),
-            ErrorRepr::ParseIntError(ref err) => Some(err as &error::Error),
-            ErrorRepr::IoError(ref err) => Some(err as &error::Error),
-            ErrorRepr::ImagefmtError(ref err) => Some(err as &error::Error),
+        match *self {
+            Error::ParseError(ref err) => Some(err),
+            Error::IoError(ref err) => Some(err),
+            Error::ImagefmtError(ref err) => Some(err),
         }
     }
 }
 
-impl fmt::Display for ObjectError {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        self.desc.fmt(f)
+        match *self {
+            Error::ParseError(ref e) => e.fmt(f),
+            Error::IoError(ref e) => e.fmt(f),
+            Error::ImagefmtError(ref e) => e.fmt(f),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ParseError(String);
+
+impl error::Error for ParseError {
+    fn description(&self) -> &str {
+        "Parse Error"
+    }
+
+    fn cause(&self) -> Option<&error::Error> {
+        None
+    }
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        write!(f, "Parse Error: {}", self)
+    }
+}
+
+impl From<num::ParseFloatError> for ParseError {
+    fn from(err: num::ParseFloatError) -> ParseError {
+        ParseError(format!("{}", err))
+    }
+}
+
+impl From<num::ParseIntError> for ParseError {
+    fn from(err: num::ParseIntError) -> ParseError {
+        ParseError(format!("{}", err))
     }
 }
 
@@ -137,7 +148,7 @@ pub struct Object {
 }
 
 impl Object {
-    pub fn read<P: AsRef<Path>>(path: P) -> Result<Self, ObjectError> {
+    pub fn read<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
         let p = path.as_ref();
         let mut pb = p.to_path_buf();
         pb.set_file_name(p.file_stem().unwrap().to_string_lossy().to_string() + "_diffuse");
@@ -151,22 +162,11 @@ impl Object {
             tex: t,
         };
 
-        let f = try!(File::open(p));
-        let f = BufReader::new(f);
-        for line in f.lines() {
-            match line {
-                Ok(l) => {
-                    try!(obj.parse_line(l));
-                }
-                Err(e) => {
-                    return Err(ObjectError {
-                        desc: "failed to read line",
-                        cause: ErrorRepr::IoError(e),
-                    })
-                }
-            }
+        let f = BufReader::new(try!(File::open(p)));
+        for (line_number, line) in f.lines().enumerate().map(|(a,b)| { (a+1, b) }) {
+            let l = try!(line);
+            try!(obj.parse_line(l).map_err(|e| { ParseError(format!("{} at line {}", e, line_number)) }));
         }
-
         Ok(obj)
     }
 
@@ -182,76 +182,63 @@ impl Object {
     pub fn sample(&self, uv: Vec3f) -> draw::RGB {
         self.tex.sample(uv)
     }
-    fn parse_line(&mut self, l: String) -> Result<(), ObjectError> {
+
+    fn parse_line(&mut self, l: String) -> Result<(), ParseError> {
         let p: Vec<_> = l.split_whitespace().collect();
         if p.is_empty() {
             return Ok(());
         }
-        match p[0] {
-            "#" => info!("Comment {:?}", p),
-            "f" => return self.add_face(p),
-            "v" => return self.add_vertex(p),
-            "vn" => debug!("Vertex normal {:?}", p),
-            "vt" => return self.add_texcoord(p),
-            _ => info!("Unknown line type: {:?}", p),
+        match (p[0], &p[1..]) {
+            ("#", _)  => { info!("Comment {:?}", l); Ok(()) },
+            ("f", face) => self.add_face(face),
+            ("v", vertex) => self.add_vertex(vertex),
+            ("vn", _) => { debug!("Vertex normal {:?}", l); Ok(()) },
+            ("vt", tex) => self.add_texcoord(tex),
+            (t, _) => { info!("Unknown line type: {:?}", t); Ok(()) },
         }
-        Ok(())
     }
 
-    fn add_face(&mut self, p: Vec<&str>) -> Result<(), ObjectError> {
+    fn add_face(&mut self, p: &[&str]) -> Result<(), ParseError> {
         debug!("Face {:?}", p);
         // TODO(wathiede): add support for quad faces, triangles only for now.
-        if p.len() != 4 {
-            return Err(ObjectError {
-                desc: "Bad vertex line",
-                cause: ErrorRepr::ParseError(p.join(" ")),
-            });
-        };
+        if p.len() != 3 {
+            return Err(ParseError("Bad vertex line".into()));
+        }
         let mut f = FaceIndex::new();
-        for n in p.iter().skip(1) {
-            for (i, c) in n.split("/").enumerate() {
-                // Face indices in wavefront object files are 1-based.
-                let idx = try!(c.parse::<usize>()) - 1;
-                match (i, idx) {
-                    (0, idx) => f.v_idxs.push(idx),
-                    (1, idx) => f.t_idxs.push(idx),
-                    (2, idx) => f.n_idxs.push(idx),
-                    (_, _) => panic!("Found more than 3 components in face"),
-                }
+        for n in p {
+            for (vec, idx) in [&mut f.v_idxs, &mut f.t_idxs, &mut f.n_idxs].iter_mut().zip(n.split("/")) {
+                vec.push(try!(idx.parse::<usize>()) - 1);
             }
         }
         self.faces.push(f);
         Ok(())
     }
 
-    fn add_vertex(&mut self, p: Vec<&str>) -> Result<(), ObjectError> {
+    fn add_vertex(&mut self, p: &[&str]) -> Result<(), ParseError> {
         debug!("Vertex {:?}", p);
         // "v <x> <y> <z>"
-        if p.len() != 4 {
-            return Err(ObjectError {
-                desc: "Bad line", /* desc: format!("Got {} vert components, expected 4: {:?}", p.len(), p).to_string(), */
-                cause: ErrorRepr::ParseError(p.join(" ")),
-            });
+        if p.len() != 3 {
+            return Err(ParseError("Bad line".into()));
         };
-        let x = try!(p[1].parse::<f32>());
-        let y = try!(p[2].parse::<f32>());
-        let z = try!(p[3].parse::<f32>());
-        self.vertices.push(Vertex { x: x, y: y, z: z });
+        self.vertices.push(Vertex {
+            x: try!(p[0].parse()),
+            y: try!(p[1].parse()),
+            z: try!(p[2].parse()),
+        });
         Ok(())
     }
-    fn add_texcoord(&mut self, p: Vec<&str>) -> Result<(), ObjectError> {
+
+    fn add_texcoord(&mut self, p: &[&str]) -> Result<(), ParseError> {
         debug!("Texcoord {:?}", p);
         // "vt <x> <y> <z>"
-        if p.len() != 4 {
-            return Err(ObjectError {
-                desc: "Bad texcoord line",
-                cause: ErrorRepr::ParseError(p.join(" ")),
-            });
+        if p.len() != 3 {
+            return Err(ParseError("Bad texcoord line".into()));
         };
-        let x = try!(p[1].parse::<f32>());
-        let y = try!(p[2].parse::<f32>());
-        let z = try!(p[3].parse::<f32>());
-        self.texcoords.push(Vertex { x: x, y: y, z: z });
+        self.texcoords.push(Vertex {
+            x: try!(p[0].parse()),
+            y: try!(p[1].parse()),
+            z: try!(p[2].parse())
+        });
         Ok(())
     }
 }
